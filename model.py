@@ -190,51 +190,20 @@ class ft_resnest50(nn.Module):
             model_ft.layer4[0].conv2.stride = (1,1)
         model_ft.avgpool = nn.AdaptiveAvgPool2d((1,1))
         self.model = model_ft
-        from resnest import sum_relu_2
-        from resnest import nsrelu
-        self.nsrelu = nsrelu.NSReLU()
-        self.Sum_ReLU_2 = sum_relu_2.Sum_ReLU_2()
         self.classifier = ClassBlock(2048, class_num, droprate)
 
     def forward(self, x):
         x = self.model.conv1(x)
-
-        # print(x.shape)
-
-        x = self.model.bn1(x)
-        
-        # print(x.shape)
-        # x = self.model.relu(x)
-        # sum_relu_2
-        x = self.Sum_ReLU_2(x)
-        # x = self.nsrelu(x)
-        # print(x.shape)
-
-
+        x = self.model.bn1(x)    
+        x = self.WReLU(x)
         x = self.model.maxpool(x)
-
-        # print(x.shape)
-
         x = self.model.layer1(x)
-
-        # print(x.shape)
         x = self.model.layer2(x)
-        # print(x.shape)
         x = self.model.layer3(x)
-        # print(x.shape)
         x = self.model.layer4(x)
-        print(x.shape)
-
-
-
-
         x = self.model.avgpool(x)
-        print(x.shape)
-
         x = x.view(x.size(0), x.size(1))
-        print(x.shape)
         x = self.classifier(x)
-        print(x.shape)
         return x        
         
         
