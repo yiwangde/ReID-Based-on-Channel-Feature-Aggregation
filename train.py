@@ -16,65 +16,39 @@ import matplotlib.pyplot as plt
 #from PIL import Image
 import time
 import os
-from model import ft_net, ft_net_dense, ft_net_NAS, PCB, ft_resnest50, ft_resnest269, resneft50
+from model import ft_net, ft_net_dense, ft_net_NAS, PCB, ft_resnest50
 from random_erasing import RandomErasing
 import yaml
-import math
 from shutil import copyfile
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel
+from circle_loss import CircleLoss, convert_label_to_similarity
 
 version =  torch.__version__
 #fp16
 try:
     from apex.fp16_utils import *
-    from apex import amp, optimizers
+    from apex import amp
 except ImportError: # will be 3.x series
     print('This is not an error. If you want to use low precision, i.e., fp16, please install the apex with cuda support (https://github.com/NVIDIA/apex) and update pytorch to 1.0')
-
-import torch.nn.functional as F
-# from pyramid import pyramid
-import numpy as np
-
-num_classes = 751
-
-def DMI_loss(output, target):
-    outputs = F.softmax(output, dim=1)
-    targets = target.reshape(target.size(0), 1).cpu()
-    y_onehot = torch.FloatTensor(target.size(0), num_classes).zero_()
-    y_onehot.scatter_(1, targets, 1)
-    y_onehot = y_onehot.transpose(0, 1).cuda()
-    mat = y_onehot @ outputs
-    mat = mat / target.size(0)
-    return -1.0 * torch.log(torch.abs(torch.det(mat.float())) + 0.001)
-
-
 ######################################################################
 # Options
 # --------
 parser = argparse.ArgumentParser(description='Training')
-parser.add_argument('--gpu_ids',default='0', type=str,help='gpu_ids: e.g. 0  0,1,2  0,2')
+parser.add_argument('--gpu_ids',default='0,1,2,3', type=str,help='gpu_ids: e.g. 0  0,1,2  0,2')
 parser.add_argument('--name',default='ft_ResNet50', type=str, help='output model name')
-parser.add_argument('--data_dir',default='./DukeMTMC-reID/pytorch',type=str, help='training dir path')
+parser.add_argument('--data_dir',default='./market1501/pytorch',type=str, help='training dir path')
 parser.add_argument('--train_all', action='store_true', help='use all training data' )
 parser.add_argument('--color_jitter', action='store_true', help='use color jitter in training' )
-parser.add_argument('--batchsize', default=8, type=int, help='batchsize')
+parser.add_argument('--batchsize', default=32, type=int, help='batchsize')
 parser.add_argument('--stride', default=2, type=int, help='stride')
-parser.add_argument('--use_pyramid', action='store_true', help='use pyramid' )
-parser.add_argument('--erasing_p', default=0, type=float, help='Random Erasing probability, in [0,1]')
+parser.add_argument('--erasing_p', default=0.85, type=float, help='Random Erasing probability, in [0,1]')
 parser.add_argument('--use_dense', action='store_true', help='use densenet121' )
-parser.add_argument('--use_resnest50', action='store_true', help='use resnest50' )
-parser.add_argument('--use_resneft50', action='store_true', help='use resneft50' )
-parser.add_argument('--use_resnest269', action='store_true', help='use resnest269' )
+parser.add_argument('--use_resnest', action='store_true', help='use resnest50' )
 parser.add_argument('--use_NAS', action='store_true', help='use NAS' )
-parser.add_argument('--warm_epoch', default=0, type=int, help='the first K epoch that needs warm up')
-parser.add_argument('--lr', default=0.05, type=float, help='learning rate')
+parser.add_argument('--warm_epoch', default=5, type=int, help='the first K epoch that needs warm up')
+parser.add_argument('--lr', default=0.02, type=float, help='learning rate')
 parser.add_argument('--droprate', default=0.5, type=float, help='drop rate')
 parser.add_argument('--PCB', action='store_true', help='use PCB+ResNet50' )
-parser.add_argument('--rank', type=int, default=-1 )
-parser.add_argument('--world_size', type=int, default=1 )
-parser.add_argument('--local_rank', type=int, default=-1 )
+parser.add_argument('--circle', action='store_true', help='use Circle loss' )
 parser.add_argument('--fp16', action='store_true', help='use float16 instead of float32, which will save about 50% memory' )
 opt = parser.parse_args()
 
@@ -149,13 +123,9 @@ image_datasets['train'] = datasets.ImageFolder(os.path.join(data_dir, 'train' + 
 image_datasets['val'] = datasets.ImageFolder(os.path.join(data_dir, 'val'),
                                           data_transforms['val'])
 
-
-# dataloader = DataLoader(dataset, batch_size=batch_size_per_gpu, sampler=datasampler)
-
 dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=opt.batchsize,
                                              shuffle=True, num_workers=8, pin_memory=True) # 8 workers may work faster
               for x in ['train', 'val']}
-              
 dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
 class_names = image_datasets['train'].classes
 
@@ -184,16 +154,15 @@ y_err = {}
 y_err['train'] = []
 y_err['val'] = []
 
-def train_model(model, optimizer, scheduler, criterion, num_epochs=25, local_rank=-1):
+def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
     since = time.time()
 
     #best_model_wts = model.state_dict()
     #best_acc = 0.0
-    
-    
     warm_up = 0.1 # We start from the 0.1*lrRate
     warm_iteration = round(dataset_sizes['train']/opt.batchsize)*opt.warm_epoch # first 5 epoch
-
+    if opt.circle:
+        criterion_circle = CircleLoss(m=0.25, gamma=32)
     for epoch in range(num_epochs):
         print('Epoch {}/{}'.format(epoch, num_epochs - 1))
         print('-' * 10)
@@ -236,13 +205,20 @@ def train_model(model, optimizer, scheduler, criterion, num_epochs=25, local_ran
                 else:
                     outputs = model(inputs)
 
-                if not opt.PCB:
+                sm = nn.Softmax(dim=1)
+                if opt.circle: 
+                    _, logits, ff = outputs
+                    fnorm = torch.norm(ff, p=2, dim=1, keepdim=True)
+                    ff = ff.div(fnorm.expand_as(ff))
+                    loss = criterion(logits, labels) + criterion_circle(*convert_label_to_similarity( ff, labels))/now_batch_size
+                    #loss = criterion_circle(*convert_label_to_similarity( ff, labels))
+                    _, preds = torch.max(logits.data, 1)
+
+                elif not opt.PCB:  #  norm
                     _, preds = torch.max(outputs.data, 1)
                     loss = criterion(outputs, labels)
-                    # loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
-                else:
+                else: # PCB
                     part = {}
-                    sm = nn.Softmax(dim=1)
                     num_part = 6
                     for i in range(num_part):
                         part[i] = outputs[i]
@@ -257,7 +233,7 @@ def train_model(model, optimizer, scheduler, criterion, num_epochs=25, local_ran
                 # backward + optimize only if in training phase
                 if epoch<opt.warm_epoch and phase == 'train': 
                     warm_up = min(1.0, warm_up + 0.9 / warm_iteration)
-                    loss *= warm_up
+                    loss = loss*warm_up
 
                 if phase == 'train':
                     if fp16: # we use optimier to backward loss
@@ -342,27 +318,13 @@ def save_network(network, epoch_label):
 #
 
 if opt.use_dense:
-    model = ft_net_dense(len(class_names), opt.droprate)
+    model = ft_net_dense(len(class_names), opt.droprate, circle = opt.circle)
 elif opt.use_NAS:
     model = ft_net_NAS(len(class_names), opt.droprate)
-    
-elif opt.use_resnest50:
-    model = ft_resnest50(len(class_names), opt.droprate)
-    # model=model.load_state_dict(torch.load('/home/luguangjian/reid/model/resnest50_all_leakyrelu/net_19.pth'))
-    
-elif opt.use_resnest269:
-    model = ft_resnest269(len(class_names), opt.droprate)
-
-elif opt.use_pyramid:
-    model = pyramid.Pyramid(num_classes=len(class_names))
-
-elif opt.use_resneft50:
-        model = resneft50(len(class_names))
-
-
+elif opt.use_resnest:
+    model = ft_resnest50(len(class_names), opt.droprate, opt.stride)
 else:
-    model = ft_net(len(class_names), opt.droprate, opt.stride)
-    
+    model = ft_net(len(class_names), opt.droprate, opt.stride, circle =opt.circle)
 
 if opt.PCB:
     model = PCB(len(class_names))
@@ -372,25 +334,12 @@ opt.nclasses = len(class_names)
 print(model)
 
 if not opt.PCB:
-    
     ignored_params = list(map(id, model.classifier.parameters() ))
     base_params = filter(lambda p: id(p) not in ignored_params, model.parameters())
     optimizer_ft = optim.SGD([
              {'params': base_params, 'lr': 0.1*opt.lr},
              {'params': model.classifier.parameters(), 'lr': opt.lr}
          ], weight_decay=5e-4, momentum=0.9, nesterov=True)
-    '''
-    finetuned_params = list(model.base.parameters())
-    new_params = [p for n, p in model.named_parameters()
-            if not n.startswith('base.')]
-    param_groups = [{'params': finetuned_params, 'lr': opt.lr},
-            {'params': new_params, 'lr': opt.lr}]
-    optimizer_ft = optim.SGD(param_groups, momentum=0.9, weight_decay=5e-4)
-    '''
-
-
-
-
 else:
     ignored_params = list(map(id, model.model.fc.parameters() ))
     ignored_params += (list(map(id, model.classifier0.parameters() )) 
@@ -437,15 +386,15 @@ with open('%s/opts.yaml'%dir_name,'w') as fp:
     yaml.dump(vars(opt), fp, default_flow_style=False)
 
 # model to gpu
-model = model.cuda()
+# model = model.cuda()
+model = nn.DataParallel(model.cuda(), device_ids=gpu_ids, output_device=gpu_ids[0])
 if fp16:
     #model = network_to_half(model)
     #optimizer_ft = FP16_Optimizer(optimizer_ft, static_loss_scale = 128.0)
     model, optimizer_ft = amp.initialize(model, optimizer_ft, opt_level = "O1")
 
 criterion = nn.CrossEntropyLoss()
-# criterion = nn.HingeEmbeddingLoss()
-# criterion = DMI_loss
 
-model = train_model(model, optimizer_ft, exp_lr_scheduler, criterion, num_epochs=100, local_rank=opt.local_rank)
+model = train_model(model, criterion, optimizer_ft, exp_lr_scheduler,
+                       num_epochs=100)
 
